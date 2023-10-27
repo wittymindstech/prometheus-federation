@@ -1,0 +1,42 @@
+[
+ {
+ "targets": [
+ "192.168.0.11:9090"
+ ],
+ "labels": {
+ "job": "ne-federation",
+ "element_name": "node-1",
+ "__metrics_path__": "/api/v1/rbfs/elements/node-1/services/prometheus/proxy/federate"
+ }
+ },
+ {
+ "targets": [
+ "192.168.0.12:9090"
+ ],
+ "labels": {
+ "job": "ne-federation",
+ "element_name": "node-2",
+ "__metrics_path__": "/api/v1/rbfs/elements/node-2/services/prometheus/proxy/federate"
+ }
+ },
+ {
+ "targets": [
+ "192.168.0.13:9090"
+ ],
+ "labels": {
+ "job": "ne-federation",
+ "element_name": "node-3",
+ "__metrics_path__": "/api/v1/rbfs/elements/node-3/services/prometheus/proxy/federate"
+ }
+ },
+ {
+ "targets": [
+ "192.168.0.14:9090"
+ ],
+ "labels": {
+ "job": "ne-federation",
+ "element_name": "node-4",
+ "__metrics_path__": "/api/v1/rbfs/elements/node-4/services/prometheus/proxy/federate"
+ }
+ }
+]
