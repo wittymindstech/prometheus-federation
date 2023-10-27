@@ -1,0 +1,335 @@
+global:
+  imageRegistry: "{{ docker_url }}"
+
+fluent-forwarder:
+  enable: true
+  image:
+    repository: "{{ docker_url }}/fluent/fluent-bit"
+  serviceMonitor:
+    enabled: true
+  config:
+    inputs: |
+      [INPUT]
+          Name tail
+          Path /var/log/containers/*.log
+          Parser docker
+          Tag kube.POD{{ values_pod_name.split('/')[-1] }}.*
+          Mem_Buf_Limit 5MB
+          Skip_Long_Lines On
+
+    outputs: |
+      [OUTPUT]
+          Name          forward
+          Match         *
+          Host          {{ values_ems_fluentd_ip }}
+          Port          24224
+          Self_Hostname pod-fluent-forwarder
+          tls           off
+          tls.verify    off
+
+fluent-aggregator:
+  enable: true
+  image:
+    repository: "{{ values_repository_docker_url }}/fluent/fluent-bit"
+  serviceMonitor:
+    enabled: true
+  serviceUDP:
+    annotations:
+      metallb.universe.tf/address-pool: rsyslog
+  config:
+    outputs: |
+      [OUTPUT]
+          Name          forward
+          Match         *
+          Host          {{ values_ems_fluentd_ip }}
+          Port          24224
+          Self_Hostname pod-fluent-aggregator
+          tls           off
+          tls.verify    off
+
+kube-prometheus-stack:
+  enabled: true
+  kubeProxy:
+    enabled: true
+    endpoints:
+    - 192.168.11.1
+    - 192.168.11.2
+    - 192.168.11.3
+  kubeControllerManager:
+    enabled: true
+    endpoints:
+    - 192.168.11.1
+    - 192.168.11.2
+    - 192.168.11.3
+  kubeScheduler:
+    enabled: true
+    endpoints:
+    - 192.168.11.1
+    - 192.168.11.2
+    - 192.168.11.3
+  kubeEtcd:
+    enabled: true
+    endpoints: 
+    - 192.168.11.1
+    - 192.168.11.2
+    - 192.168.11.3
+    serviceMonitor:
+      caFile: /etc/prometheus/secrets/etcd-client-cert/server-ca.crt
+      certFile: /etc/prometheus/secrets/etcd-client-cert/client.crt
+      enabled: true
+      keyFile: /etc/prometheus/secrets/etcd-client-cert/client.key
+      scheme: https
+      insecureSkipVerify: true
+  prometheus:
+    prometheusSpec:
+      additionalScrapeConfigs:
+      - job_name: 'ne-federation'
+        file_sd_configs:
+        - files:
+          - '/etc/prometheus/config_out/ne-targets.json'
+        scrape_interval: 20s
+        scrape_timeout: 20s
+        scheme: https
+        metrics_path: /federate
+        honor_labels: true
+        tls_config:
+          insecure_skip_verify: true
+        bearer_token_file: /etc/prometheus/config_out/token.txt
+        metric_relabel_configs:
+          - source_labels: [id]
+            regex: '^static-agent$'
+            action: drop
+        params:
+          match[]:
+            - '{job="bds"}'
+      - job_name: 'olt-federation'
+        scrape_interval: 20s
+        scrape_timeout: 20s
+        scheme: http
+        metrics_path: /metrics
+        honor_labels: true
+        static_configs:
+          - targets: ['kafka-topic-exporter.voltha.svc.cluster.local:8080']
+            labels:
+              element_name: "voltha-kafka"
+          - targets: ['padmee.voltha.svc.cluster.local:8081']
+            labels:
+              element_name: "padmee-voltha"
+      podMonitorSelectorNilUsesHelmValues: false
+      serviceMonitorSelectorNilUsesHelmValues: false
+      image:
+        registry: "{{ values_repository_docker_url }}"
+        repository: "prometheus/prometheus"
+      thanos:
+        image: "{{ values_repository_docker_url }}/thanos/thanos:v0.30.2"
+      thanosService:
+        enabled: true
+      retention: 14d
+
+      resources:
+        limits:
+          cpu: 1000m
+          memory: 4000Mi
+        requests:
+          cpu: 300m
+          memory: 2000Mi
+      storageSpec:
+        volumeClaimTemplate:
+          metadata:
+            name: data
+          spec:
+            storageClassName: {{ values_prometheus_storageClass }}
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 40Gi
+      containers:
+      - name: prom-fetch-token
+        image: "{{ values_repository_docker_url }}/access40/dev/pod/observability/prometheus-token-generator:{{ vars['VERSION_pod_observability'] }}"
+        env:
+        - name: POD_AUTH_URL
+          value: "http://pod-auth-service.pod-services.svc.cluster.local:80/auth/token"
+        - name: POD_KONG_SVC
+          value: "http://apigw-kong-proxy.pod-services.svc.cluster.local"
+        - name: CLIENT_ID
+          value: "rbfs"
+        - name: GRANT_TYPE
+          value: "client_credentials"
+        - name: CLIENT_SECRET
+          value: "RbfsTestSecret"
+        - name: SCOPE
+          value: "operator supervisor"
+        - name: SCOPE_NE
+          value: "openid"
+        - name: NE_PROMETHEUS_PORT
+          value: "12321"
+        - name: IDP_AUTH_URL
+          value: "{{ values_ems_keycloak_ingress }}"
+        volumeMounts:
+          - name: config-out
+            mountPath: /pod-data
+      replicas: 2
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app.kubernetes.io/instance
+                operator: In
+                values:
+                - observability-kube-prometh-prometheus
+            topologyKey: "kubernetes.io/hostname"
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: alertmanager
+                operator: In
+                values:
+                - observability-kube-prometh-alertmanager
+            topologyKey: "kubernetes.io/hostname"
+
+  prometheusOperator:
+    image:
+      registry: "{{ values_repository_docker_url }}"
+      repository: "prometheus-operator/prometheus-operator"
+      volumeMounts:
+        - mountPath: /etc/prometheus/secrets/etcd-client-cert
+          name: etcd-client-cert
+      volumes:
+        - name: etcd-client-cert
+          hostPath:
+            path: /var/lib/rancher/k3s/server/tls/etcd
+    prometheusConfigReloader:
+      image:
+        registry: "{{ values_repository_docker_url }}"
+        repository: "prometheus-operator/prometheus-config-reloader"
+       
+    resources:
+      limits:
+        cpu: 100m
+        memory: 100Mi
+      requests:
+        cpu: 50m
+        memory: 50Mi
+    admissionWebhooks:
+      patch:
+        image:
+          registry: "{{ values_repository_docker_url }}"
+          repository: "ingress-nginx/kube-webhook-certgen"
+
+  prometheus-node-exporter:
+    image:
+      registry: "{{ values_repository_docker_url }}"
+      repository: "prometheus/node-exporter"
+    resources:
+      limits:
+        cpu: 100m
+        memory: 100Mi
+      requests:
+        cpu: 50m
+        memory: 50Mi
+  kube-state-metrics:
+    image:
+      registry: "{{ values_repository_docker_url }}"
+      repository: "kube-state-metrics/kube-state-metrics"
+    resources:
+      limits:
+        cpu: 100m
+        memory: 100Mi
+      requests:
+        cpu: 50m
+        memory: 50Mi
+
+  kubelet:
+    serviceMonitor:
+      cAdvisorMetricRelabelings:
+         # Drop less useful container CPU metrics.
+         - sourceLabels: [__name__]
+           action: drop
+           regex: 'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)'
+         # Drop less useful container / always zero filesystem metrics.
+         - sourceLabels: [__name__]
+           action: drop
+           regex: 'container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)'
+         # Drop less useful / always zero container memory metrics.
+         - sourceLabels: [__name__]
+           action: drop
+           regex: 'container_memory_(mapped_file|swap)'
+         # Drop less useful container process metrics.
+         - sourceLabels: [__name__]
+           action: drop
+           regex: 'container_(file_descriptors|tasks_state|threads_max)'
+         # Drop cgroup metrics with no pod.
+         - sourceLabels: [id, pod]
+           action: drop
+           regex: '.+;'
+
+  alertmanager:
+    enabled: true
+    alertmanagerSpec:
+      image:
+        registry: "{{ values_repository_docker_url }}"
+        repository: "prometheus/alertmanager"
+      resources:
+        limits:
+          cpu: 200m
+          memory: 150Mi
+        requests:
+          cpu: 200m
+          memory: 50Mi
+      replicas: 2
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: alertmanager
+                operator: In
+                values:
+                - observability-kube-prometh-alertmanager 
+            topologyKey: "kubernetes.io/hostname"
+
+    service:
+      type: ClusterIP
+    config:
+      global:
+        resolve_timeout: 10m
+      route:
+        group_by: ['alertname', 'nodeName', 'hostName', 'podName', 'containerName', 'pod_uid', 'sensorName', 'fanName', 'interfaceName']
+        group_wait: 10s
+        group_interval: 2m
+        repeat_interval: 720h
+        receiver: 'null'
+        routes:
+          - receiver: 'podwebhook'
+            matchers:
+              - neType = POD_SERVER
+          - receiver: 'podwebhook'
+            matchers:
+              - clusterType = POD
+      receivers:
+        - name: 'null'
+        - name: 'podwebhook'
+          webhook_configs:
+            - url: 'http://pod-prometheus-webhook-businessevents.pod-services.svc.cluster.local/api/prometheusWebhook/v1/alert'
+              send_resolved: true
+
+thanos:
+  query:
+    enabled: true
+    logLevel: info
+    logFormat: logfmt
+    replicaLabel: prometheus_replica
+    dnsDiscovery:
+      enabled: true
+      sidecarsService: "prometheus-operated"
+      sidecarsNamespace: "observability"
+    replicaCount: 1
+    service:
+      type: LoadBalancer
+      annotations: 
+        metallb.universe.tf/allow-shared-ip: {{ values_aggregator_ip }}
+      loadBalancerIP: {{ values_aggregator_ip }}
+  queryFrontend:
+    enabled: false
